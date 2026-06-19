@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / web
+web/node_modules
+web/dist
+web/.vite
+
+# direnv / nix
+.direnv/
+.envrc.local
+
+# Local-only data — real IGC flights never get committed
+flights/
+*.igc.local
+.cache/
+
+# Editor
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
