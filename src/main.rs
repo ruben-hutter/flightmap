@@ -1,110 +1,199 @@
-//! flightmap-cli — Phase 0 entrypoint: parse one IGC file, print stats.
+//! flightmap-cli — entrypoint for Phase 0+ operations.
+//!
+//! Subcommands:
+//!   flightmap stats <file>       Print point count / bbox / alt range for one IGC.
+//!   flightmap scan  <folder>     Parse every .igc in <folder>, print summary.
+//!   flightmap emit  <folder>     Parse + simplify + detect climbs, write
+//!                                skyway.geojson + thermal.geojson to --out.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-use flightmap::{parse_igc, SourceKind};
+use flightmap::{build_products, detect_climbs, simplify_flight, ClimbConfig, LocalFolder, Source};
 
 #[derive(Parser)]
 #[command(
     name = "flightmap",
     version,
-    about = "Parse IGC tracklogs and emit stats / GeoJSON"
+    about = "Parse IGC tracklogs → personal paragliding heatmap (skyway + thermal GeoJSON)"
 )]
 struct Cli {
-    /// Path to a single .igc file.
-    path: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print stats for a single IGC file (point count, UTC range, bbox, alt range).
+    Stats { path: PathBuf },
+
+    /// Parse every `.igc` under <folder> (recursively) and print a one-line summary.
+    Scan { folder: PathBuf },
+
+    /// Parse + simplify + detect climbs, then write skyway.geojson and
+    /// thermal.geojson to --out (defaults to `./out`). The web/ frontend
+    /// fetches these files.
+    Emit(EmitArgs),
+}
+
+#[derive(Parser)]
+struct EmitArgs {
+    /// Folder of `.igc` files (recursive).
+    folder: PathBuf,
+    /// Output directory for skyway.geojson + thermal.geojson. Created if missing.
+    #[arg(long, default_value = "./out")]
+    out: PathBuf,
+    /// Douglas–Peucker track simplification tolerance, metres.
+    #[arg(long, default_value_t = 5.0)]
+    tolerance_m: f64,
+    /// Minimum smoothed climb rate, m/s.
+    #[arg(long, default_value_t = 0.5)]
+    min_climb_ms: f32,
+    /// Minimum climb segment duration, seconds.
+    #[arg(long, default_value_t = 10.0)]
+    min_duration_s: f32,
+    /// Altitude smoothing window, seconds.
+    #[arg(long, default_value_t = 5.0)]
+    smoothing_window_s: f32,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let text = std::fs::read_to_string(&cli.path)
-        .with_context(|| format!("reading {}", cli.path.display()))?;
+    match cli.command {
+        Command::Stats { path } => stats(&path),
+        Command::Scan { folder } => scan(&folder),
+        Command::Emit(args) => emit(args),
+    }
+}
+
+fn stats(path: &Path) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let id = format!(
         "{}:{}",
-        SourceKind::Local.prefix(),
-        cli.path.file_name().unwrap_or_default().to_string_lossy()
+        flightmap::SourceKind::Local.prefix(),
+        path.file_name().unwrap_or_default().to_string_lossy()
     );
-    let flight = parse_igc(&text, &id).context("parsing IGC")?;
+    let flight = flightmap::parse_igc(&text, &id).context("parsing IGC")?;
+    print!("{}", render_stats(&flight));
+    Ok(())
+}
 
-    let stats = flightmap_stats::summarize(&flight);
-    println!("{}", stats);
+fn scan(folder: &Path) -> Result<()> {
+    let source = LocalFolder::new(folder.to_path_buf());
+    let flights = source.flights().context("scanning folder")?;
+
+    eprintln!("parsed {} flights from {}", flights.len(), folder.display());
+
+    let total_points: usize = flights.iter().map(|f| f.points.len()).sum();
+    let total_climbs: usize = flights
+        .iter()
+        .map(|f| detect_climbs(f, &ClimbConfig::default()).len())
+        .sum();
+
+    let simplified_points: usize = flights
+        .iter()
+        .map(|f| simplify_flight(f, 5.0).points.len())
+        .sum();
+
+    println!(
+        "flights: {n}\n\
+         raw points: {total_points}\n\
+         simplified points (@5m): {simplified_points}\n\
+         compression: {ratio:.1}×\n\
+         climbs detected: {total_climbs}",
+        n = flights.len(),
+        ratio = total_points as f64 / simplified_points.max(1) as f64,
+    );
 
     Ok(())
 }
 
-// Kept in an inner module so the rendering logic is unit-testable without
-// pulling the binary into a test build.
-mod flightmap_stats {
-    use flightmap::Flight;
+fn emit(args: EmitArgs) -> Result<()> {
+    let source = LocalFolder::new(args.folder.clone());
+    let flights = source.flights().context("scanning folder")?;
 
-    pub struct Summary {
-        pub id: String,
-        pub point_count: usize,
-        pub start: chrono::NaiveDateTime,
-        pub end: chrono::NaiveDateTime,
-        pub min_lat: f64,
-        pub max_lat: f64,
-        pub min_lon: f64,
-        pub max_lon: f64,
-        pub baro_min: Option<i32>,
-        pub baro_max: Option<i32>,
-        pub gps_min: Option<i32>,
-        pub gps_max: Option<i32>,
+    eprintln!("parsed {} flights", flights.len());
+
+    let climb_config = ClimbConfig {
+        min_climb_ms: args.min_climb_ms,
+        min_duration_s: args.min_duration_s,
+        smoothing_window_s: args.smoothing_window_s,
+    };
+    let products = build_products(&flights, args.tolerance_m, &climb_config);
+
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("creating {}", args.out.display()))?;
+
+    let skyway_path = args.out.join("skyway.geojson");
+    let thermal_path = args.out.join("thermal.geojson");
+
+    let skyway_json = serde_json::to_string_pretty(&products.skyway)?;
+    let thermal_json = serde_json::to_string_pretty(&products.thermal)?;
+
+    std::fs::write(&skyway_path, skyway_json)?;
+    std::fs::write(&thermal_path, thermal_json)?;
+
+    let skyway_size = std::fs::metadata(&skyway_path)?.len();
+    let thermal_size = std::fs::metadata(&thermal_path)?.len();
+    let skyway_features = products.skyway.features.len();
+    let thermal_features = products.thermal.features.len();
+
+    println!(
+        "wrote:\n  {} ({skyway_features} features, {} bytes)\n  {} ({thermal_features} features, {} bytes)",
+        skyway_path.display(),
+        skyway_size,
+        thermal_path.display(),
+        thermal_size,
+    );
+
+    Ok(())
+}
+
+fn render_stats(flight: &flightmap::Flight) -> String {
+    let mut s = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(s, "flight:     {}", flight.id);
+    let _ = writeln!(s, "points:     {}", flight.points.len());
+    if let Some(first) = flight.points.first() {
+        let _ = writeln!(s, "start(UTC): {}", first.time);
     }
+    if let Some(last) = flight.points.last() {
+        let _ = writeln!(s, "end  (UTC): {}", last.time);
+    }
+    let (min_lat, max_lat) = min_max(flight.points.iter().map(|p| p.lat));
+    let (min_lon, max_lon) = min_max(flight.points.iter().map(|p| p.lon));
+    let _ = writeln!(
+        s,
+        "bbox:       lat [{min_lat:.5}, {max_lat:.5}]  lon [{min_lon:.5}, {max_lon:.5}]"
+    );
+    if let (Some(lo), Some(hi)) = (
+        flight.points.iter().filter_map(|p| p.alt_baro).min(),
+        flight.points.iter().filter_map(|p| p.alt_baro).max(),
+    ) {
+        let _ = writeln!(s, "alt baro:   {lo} .. {hi} m");
+    }
+    if let (Some(lo), Some(hi)) = (
+        flight.points.iter().filter_map(|p| p.alt_gps).min(),
+        flight.points.iter().filter_map(|p| p.alt_gps).max(),
+    ) {
+        let _ = writeln!(s, "alt gps:    {lo} .. {hi} m");
+    }
+    s
+}
 
-    pub fn summarize(f: &Flight) -> Summary {
-        let mut s = Summary {
-            id: f.id.clone(),
-            point_count: f.points.len(),
-            start: f.points.first().unwrap().time,
-            end: f.points.last().unwrap().time,
-            min_lat: f64::INFINITY,
-            max_lat: f64::NEG_INFINITY,
-            min_lon: f64::INFINITY,
-            max_lon: f64::NEG_INFINITY,
-            baro_min: None,
-            baro_max: None,
-            gps_min: None,
-            gps_max: None,
-        };
-        for p in &f.points {
-            s.min_lat = s.min_lat.min(p.lat);
-            s.max_lat = s.max_lat.max(p.lat);
-            s.min_lon = s.min_lon.min(p.lon);
-            s.max_lon = s.max_lon.max(p.lon);
-            if let Some(b) = p.alt_baro {
-                s.baro_min = Some(s.baro_min.map_or(b, |m| m.min(b)));
-                s.baro_max = Some(s.baro_max.map_or(b, |m| m.max(b)));
-            }
-            if let Some(g) = p.alt_gps {
-                s.gps_min = Some(s.gps_min.map_or(g, |m| m.min(g)));
-                s.gps_max = Some(s.gps_max.map_or(g, |m| m.max(g)));
-            }
+fn min_max(iter: impl IntoIterator<Item = f64>) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for v in iter {
+        if v < min {
+            min = v;
         }
-        s
-    }
-
-    impl std::fmt::Display for Summary {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            writeln!(f, "flight:     {}", self.id)?;
-            writeln!(f, "points:     {}", self.point_count)?;
-            writeln!(f, "start(UTC): {}", self.start)?;
-            writeln!(f, "end  (UTC): {}", self.end)?;
-            writeln!(
-                f,
-                "bbox:       lat [{:.5}, {:.5}]  lon [{:.5}, {:.5}]",
-                self.min_lat, self.max_lat, self.min_lon, self.max_lon
-            )?;
-            if let (Some(lo), Some(hi)) = (self.baro_min, self.baro_max) {
-                writeln!(f, "alt baro:   {lo} .. {hi} m")?;
-            }
-            if let (Some(lo), Some(hi)) = (self.gps_min, self.gps_max) {
-                writeln!(f, "alt gps:    {lo} .. {hi} m")?;
-            }
-            Ok(())
+        if v > max {
+            max = v;
         }
     }
+    (min, max)
 }

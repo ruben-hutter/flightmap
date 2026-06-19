@@ -1,10 +1,18 @@
 //! flightmap — personal paragliding flight heatmap from IGC tracklogs.
 //!
-//! See PLAN.md for the design. This crate will grow with phases 0–4; right now
-//! (Phase 0) it exposes the core data model and the IGC parser.
+//! See PLAN.md for the design. This crate grows with phases 0–4.
 
+pub mod aggregate;
+pub mod climb;
+pub mod geo;
 pub mod igc;
+pub mod ingest;
 pub mod model;
+pub mod simplify;
 
+pub use aggregate::{build_products, skyway_collection, thermal_collection, Products};
+pub use climb::{detect_climbs, ClimbConfig};
 pub use igc::{parse_igc, IgcError};
+pub use ingest::{local::LocalFolder, Source, SourceError};
 pub use model::{ClimbSegment, Flight, SourceKind, TrackPoint};
+pub use simplify::simplify_flight;

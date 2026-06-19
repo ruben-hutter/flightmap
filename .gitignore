@@ -17,6 +17,9 @@ flights/
 *.igc.local
 .cache/
 
+# Emitted GeoJSON from `flightmap emit`
+out/
+
 # Editor
 .idea/
 .vscode/
