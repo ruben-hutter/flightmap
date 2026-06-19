@@ -11,32 +11,58 @@
 
 import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
-import { PathLayer } from "@deck.gl/layers";
-import { HeatmapLayer } from "@deck.gl/aggregation-layers";
+import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 type SkywayFeature = Feature<LineString, { id: string; points: number }>;
-type ThermalFeature = Feature<
+type ThermalDensityFeature = Feature<
   Point,
   {
-    flight_id: string;
+    count: number;
     avg_climb_ms: number;
     peak_climb_ms: number;
-    gain_m: number;
-    start: string;
-    end: string;
+    total_gain_m: number;
   }
 >;
 
-// Free, no-API-key style. Swap for a self-hosted style.json in production.
-const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
-
 // Where `flightmap emit` writes its products. Override per-deployment via
-// ?skyway=... query param if needed.
+// ?data=... query param if needed.
 const DATA_DIR = new URLSearchParams(location.search).get("data") ?? "/data";
 const SKYWAY_URL = `${DATA_DIR}/skyway.geojson`;
-const THERMAL_URL = `${DATA_DIR}/thermal.geojson`;
+const THERMAL_DENSITY_URL = `${DATA_DIR}/thermal_density.geojson`;
+
+// Colour scale for climb intensity (m/s). Thresholds are loose paraglider
+// intuition: <1.5 weak scratch, 1.5-3.5 average thermal, >3.5 strong climb.
+// Maps to a 6-stop yellow→orange→red ramp; alpha encoded separately.
+function climbColor(rate: number): [number, number, number] {
+  // Stops: 0→blue, 1.5→cyan, 2.5→green, 3.5→yellow, 5→orange, 6+→red
+  const stops: Array<[number, [number, number, number]]> = [
+    [0.0, [33, 102, 172]],
+    [1.5, [103, 169, 207]],
+    [2.5, [128, 200, 100]],
+    [3.5, [253, 200, 50]],
+    [5.0, [239, 138, 98]],
+    [6.5, [178, 24, 43]],
+  ];
+  if (rate <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (rate <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1];
+      const [t1, c1] = stops[i];
+      const f = (rate - t0) / (t1 - t0);
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * f),
+        Math.round(c0[1] + (c1[1] - c0[1]) * f),
+        Math.round(c0[2] + (c1[2] - c0[2]) * f),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+// Free, no-API-key style. Swap for a self-hosted style.json in production.
+const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 
 const map = new maplibregl.Map({
   container: "map",
@@ -55,25 +81,30 @@ const skywayToggle = document.getElementById("toggle-skyway") as HTMLInputElemen
 const thermalToggle = document.getElementById("toggle-thermal") as HTMLInputElement;
 
 let skyway: FeatureCollection<LineString, SkywayFeature["properties"]> | null = null;
-let thermal: FeatureCollection<Point, ThermalFeature["properties"]> | null = null;
+let thermalDensity: FeatureCollection<
+  Point,
+  ThermalDensityFeature["properties"]
+> | null = null;
 
 async function load(): Promise<void> {
   const skywayPromise = fetch(SKYWAY_URL).then((r) => {
     if (!r.ok) throw new Error(`${SKYWAY_URL}: ${r.status}`);
     return r.json() as Promise<FeatureCollection<LineString, SkywayFeature["properties"]>>;
   });
-  const thermalPromise = fetch(THERMAL_URL).then((r) => {
-    if (!r.ok) throw new Error(`${THERMAL_URL}: ${r.status}`);
-    return r.json() as Promise<FeatureCollection<Point, ThermalFeature["properties"]>>;
+  const densityPromise = fetch(THERMAL_DENSITY_URL).then((r) => {
+    if (!r.ok) throw new Error(`${THERMAL_DENSITY_URL}: ${r.status}`);
+    return r.json() as Promise<
+      FeatureCollection<Point, ThermalDensityFeature["properties"]>
+    >;
   });
 
-  const [sky, therm] = await Promise.allSettled([skywayPromise, thermalPromise]);
+  const [sky, density] = await Promise.allSettled([skywayPromise, densityPromise]);
   if (sky.status === "fulfilled") skyway = sky.value;
-  if (therm.status === "fulfilled") thermal = therm.value;
+  if (density.status === "fulfilled") thermalDensity = density.value;
 
   const missing: string[] = [];
   if (sky.status !== "fulfilled") missing.push("skyway");
-  if (therm.status !== "fulfilled") missing.push("thermal");
+  if (density.status !== "fulfilled") missing.push("thermal_density");
 
   if (missing.length === 2) {
     statusEl.textContent = `failed to load ${missing.join(" + ")}.`;
@@ -86,8 +117,11 @@ async function load(): Promise<void> {
   }
 
   const skywayCount = skyway?.features.length ?? 0;
-  const thermalCount = thermal?.features.length ?? 0;
-  statsEl.textContent = `${skywayCount} flights · ${thermalCount} climbs`;
+  const climbCount = thermalDensity?.features.reduce(
+    (sum, f) => sum + f.properties.count,
+    0,
+  ) ?? 0;
+  statsEl.textContent = `${skywayCount} flights · ${climbCount} climbs`;
 
   recenter();
   rerender();
@@ -119,7 +153,7 @@ function recenter(): void {
 }
 
 function rerender(): void {
-  const layers: (PathLayer<SkywayFeature> | HeatmapLayer<ThermalFeature>)[] = [];
+  const layers: (PathLayer<SkywayFeature> | ScatterplotLayer<ThermalDensityFeature>)[] = [];
 
   if (skywayToggle.checked && skyway) {
     layers.push(
@@ -137,26 +171,46 @@ function rerender(): void {
     );
   }
 
-  if (thermalToggle.checked && thermal) {
+  if (thermalToggle.checked && thermalDensity) {
+    // ScatterplotLayer on the pre-binned Mercator grid. Much cheaper than
+    // HeatmapLayer (no per-frame density recompute); the binned cells +
+    // large translucent radii fake the heatmap look naturally.
     layers.push(
-      new HeatmapLayer<ThermalFeature>({
+      new ScatterplotLayer<ThermalDensityFeature>({
         id: "thermal",
-        data: thermal.features,
-        getPosition: (f: ThermalFeature) =>
+        data: thermalDensity.features,
+        getPosition: (f: ThermalDensityFeature) =>
           f.geometry.coordinates as unknown as [number, number],
-        getWeight: (f: ThermalFeature) => f.properties.avg_climb_ms,
-        radiusPixels: 60,
-        intensity: 1,
-        threshold: 0.05,
-        colorRange: [
-          [33, 102, 172],
-          [103, 169, 207],
-          [209, 229, 240],
-          [253, 219, 199],
-          [239, 138, 98],
-          [178, 24, 43],
-        ],
-        pickable: false,
+        // Radius scales with climb count: more visits = bigger blob.
+        // In metres so it tracks zoom naturally.
+        getRadius: (f: ThermalDensityFeature) =>
+          40 + Math.min(200, f.properties.count * 8),
+        radiusUnits: "meters",
+        radiusMinPixels: 4,
+        radiusMaxPixels: 80,
+        // Color by avg climb rate (the Phase 2 climb-rate colormap).
+        getFillColor: (f: ThermalDensityFeature) => {
+          const rgb = climbColor(f.properties.avg_climb_ms);
+          // Alpha: busier cells are more opaque.
+          const alpha = Math.min(220, 80 + f.properties.count * 12);
+          return [rgb[0], rgb[1], rgb[2], alpha];
+        },
+        opacity: 0.75,
+        stroked: false,
+        pickable: true,
+        onClick: (info) => {
+          if (!info.object) return;
+          const p = info.object.properties;
+          new maplibregl.Popup()
+            .setLngLat(info.coordinate as maplibregl.LngLatLike)
+            .setHTML(
+              `<b>${p.count} climbs</b><br/>
+               avg ${p.avg_climb_ms.toFixed(1)} m/s<br/>
+               peak ${p.peak_climb_ms.toFixed(1)} m/s<br/>
+               total gain ${p.total_gain_m} m`,
+            )
+            .addTo(map);
+        },
       }),
     );
   }

@@ -129,24 +129,31 @@ fn emit(args: EmitArgs) -> Result<()> {
 
     let skyway_path = args.out.join("skyway.geojson");
     let thermal_path = args.out.join("thermal.geojson");
+    let density_path = args.out.join("thermal_density.geojson");
 
     let skyway_json = serde_json::to_string_pretty(&products.skyway)?;
     let thermal_json = serde_json::to_string_pretty(&products.thermal)?;
+    let density_json = serde_json::to_string_pretty(&products.thermal_density)?;
 
     std::fs::write(&skyway_path, skyway_json)?;
     std::fs::write(&thermal_path, thermal_json)?;
+    std::fs::write(&density_path, density_json)?;
 
     let skyway_size = std::fs::metadata(&skyway_path)?.len();
     let thermal_size = std::fs::metadata(&thermal_path)?.len();
+    let density_size = std::fs::metadata(&density_path)?.len();
     let skyway_features = products.skyway.features.len();
     let thermal_features = products.thermal.features.len();
+    let density_features = products.thermal_density.features.len();
 
     println!(
-        "wrote:\n  {} ({skyway_features} features, {} bytes)\n  {} ({thermal_features} features, {} bytes)",
+        "wrote:\n  {} ({skyway_features} features, {} bytes)\n  {} ({thermal_features} features, {} bytes)\n  {} ({density_features} features, {} bytes)",
         skyway_path.display(),
         skyway_size,
         thermal_path.display(),
         thermal_size,
+        density_path.display(),
+        density_size,
     );
 
     Ok(())

@@ -12,17 +12,24 @@
 
 use geojson::{Feature, FeatureCollection, Geometry, Value};
 
+use crate::bin::{bin_climbs, BinnedCell, DEFAULT_CELL_SIZE_M};
 use crate::climb::detect_climbs;
 use crate::model::{ClimbSegment, Flight};
 use crate::simplify::simplify_flight;
 
-/// All Phase 1 output products, ready to serialise.
+/// All Phase 1+2 output products, ready to serialise.
 pub struct Products {
     pub skyway: FeatureCollection,
+    /// Per-climb raw points (one per [`ClimbSegment`]); used for detail
+    /// inspection / click popups. Heavy: one feature per climb.
     pub thermal: FeatureCollection,
+    /// Mercator-grid-binned climb density (one feature per non-empty cell).
+    /// Cheap to render with a `ScatterPlotLayer` — replaces the laggy
+    /// `HeatmapLayer` on the raw thermal layer.
+    pub thermal_density: FeatureCollection,
 }
 
-/// Build the skyway + thermal products for a set of flights.
+/// Build the skyway + thermal + density products for a set of flights.
 ///
 /// `tolerance_m` is the Douglas–Peucker tolerance in metres (5 m is a good
 /// default; smaller = more detail + bigger JSON, larger = coarser tracks).
@@ -39,8 +46,13 @@ pub fn build_products(
         .flat_map(|f| detect_climbs(f, climb_config))
         .collect();
     let thermal = thermal_collection(&thermals);
+    let thermal_density = thermal_density_collection(&thermals, DEFAULT_CELL_SIZE_M);
 
-    Products { skyway, thermal }
+    Products {
+        skyway,
+        thermal,
+        thermal_density,
+    }
 }
 
 /// Skyway product: one LineString feature per flight, simplified to
@@ -61,6 +73,19 @@ pub fn skyway_collection(flights: &[Flight], tolerance_m: f64) -> FeatureCollect
 /// `avg_climb_ms` for deck.gl's `HeatmapLayer`.
 pub fn thermal_collection(climbs: &[ClimbSegment]) -> FeatureCollection {
     let features: Vec<Feature> = climbs.iter().map(climb_to_thermal_feature).collect();
+    FeatureCollection {
+        bbox: None,
+        features,
+        foreign_members: None,
+    }
+}
+
+/// Thermal density product: one Point feature per non-empty Mercator grid
+/// cell. Use this with deck.gl's `ScatterPlotLayer` — far cheaper than
+/// `HeatmapLayer` on the raw thermals (no per-frame density recompute).
+pub fn thermal_density_collection(climbs: &[ClimbSegment], cell_size_m: f64) -> FeatureCollection {
+    let cells = bin_climbs(climbs, cell_size_m);
+    let features: Vec<Feature> = cells.iter().map(cell_to_density_feature).collect();
     FeatureCollection {
         bbox: None,
         features,
@@ -106,6 +131,29 @@ fn climb_to_thermal_feature(c: &ClimbSegment) -> Feature {
                 "gain_m": c.gain_m,
                 "start": c.start_time.to_string(),
                 "end": c.end_time.to_string(),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+        foreign_members: None,
+    }
+}
+
+fn cell_to_density_feature(c: &BinnedCell) -> Feature {
+    Feature {
+        bbox: None,
+        geometry: Some(Geometry::new(Value::Point(vec![
+            c.centroid_lon,
+            c.centroid_lat,
+        ]))),
+        id: None,
+        properties: Some(
+            serde_json::json!({
+                "count": c.count,
+                "avg_climb_ms": c.avg_climb_ms,
+                "peak_climb_ms": c.peak_climb_ms,
+                "total_gain_m": c.total_gain_m,
             })
             .as_object()
             .unwrap()
