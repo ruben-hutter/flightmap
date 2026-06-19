@@ -172,7 +172,12 @@ function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
     }
   }
 
-  // ---- Accumulate density ----
+  // ---- Accumulate density (MAX, not SUM) ----
+  // Per pixel, store the strongest peak climb rate that touched it (scaled
+  // by the Gaussian falloff). This is "what's the best thermal I could
+  // expect at this spot" — multiple weak thermals don't combine into a
+  // strong colour. A single 5 m/s climb paints red; ten 1 m/s climbs stay
+  // blue.
   const density = new Float32Array(width * height);
   const xScale = width / (maxLon - minLon);
   const yScale = height / (maxLat - minLat);
@@ -181,33 +186,33 @@ function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
     const [lon, lat] = f.geometry.coordinates as [number, number];
     const px = Math.round((lon - minLon) * xScale);
     const py = Math.round((maxLat - lat) * yScale); // Y flipped
-    // Weight by climb strength. Floor at 0.5 m/s so weak climbs still count.
-    const weight = Math.max(0.5, f.properties.avg_climb_ms);
+    // Peak rate is the strongest instant within the climb — the "how good
+    // was the core" signal. Floor at 0.5 so we don't divide-by-zero on
+    // degenerate climbs.
+    const peak = Math.max(0.5, f.properties.peak_climb_ms);
 
     for (let dy = -kernelRadius; dy <= kernelRadius; dy++) {
       const y = py + dy;
       if (y < 0 || y >= height) continue;
+      const rowBase = y * width;
+      const kernelRow = (dy + kernelRadius) * kernelSize;
       for (let dx = -kernelRadius; dx <= kernelRadius; dx++) {
         const x = px + dx;
         if (x < 0 || x >= width) continue;
-        density[y * width + x] +=
-          weight * kernel[(dy + kernelRadius) * kernelSize + (dx + kernelRadius)];
+        const k = kernel[kernelRow + (dx + kernelRadius)];
+        const contribution = peak * k;
+        const idx = rowBase + x;
+        if (contribution > density[idx]) density[idx] = contribution;
       }
     }
   }
 
-  // ---- Normalise and find max ----
-  let maxDensity = 0;
-  for (let i = 0; i < density.length; i++) {
-    if (density[i] > maxDensity) maxDensity = density[i];
-  }
-  if (maxDensity === 0) {
-    thermalCanvas = null;
-    thermalBounds = null;
-    return;
-  }
+  // ---- Density → RGBA (absolute scale, no normalisation) ----
+  // colours are tied to absolute m/s values, so the meaning is stable
+  // across filter changes: 5+ m/s is always red, 1 m/s is always blue.
+  const MAX_RATE = 6.0; // m/s — top of the colour ramp
+  const FULL_OPACITY_RATE = 2.5; // m/s — alpha saturates here
 
-  // ---- Density → RGBA ----
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -216,16 +221,15 @@ function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
   const data = imageData.data;
 
   for (let i = 0; i < density.length; i++) {
-    const raw = density[i] / maxDensity; // 0..1
-    if (raw < 0.02) continue; // skip near-zero (keep canvas transparent there)
-    // Gamma: lift low densities so sparse thermals are still visible
-    // without crushing high densities to pure red.
-    const t = Math.pow(raw, 0.55);
-    const [r, g, b] = densityColor(t);
+    const rate = density[i]; // peak m/s at this pixel (gauss-scaled)
+    if (rate < 0.3) continue; // skip near-zero — keep canvas transparent
+    const colorT = Math.min(1, rate / MAX_RATE);
+    const [r, g, b] = densityColor(colorT);
+    const alphaT = Math.min(1, rate / FULL_OPACITY_RATE);
     data[i * 4] = r;
     data[i * 4 + 1] = g;
     data[i * 4 + 2] = b;
-    data[i * 4 + 3] = Math.min(255, Math.round(t * 255));
+    data[i * 4 + 3] = Math.round(alphaT * 255);
   }
   ctx.putImageData(imageData, 0, 0);
 
