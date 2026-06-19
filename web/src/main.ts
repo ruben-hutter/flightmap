@@ -15,7 +15,12 @@ import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
-type SkywayFeature = Feature<LineString, { id: string; points: number }>;
+type SkywayFeature = Feature<LineString, {
+  id: string;
+  points: number;
+  start: string;
+  end: string;
+}>;
 type ThermalDensityFeature = Feature<
   Point,
   {
@@ -61,6 +66,34 @@ function climbColor(rate: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
+// Altitude colour ramp for the skyway layer (metres MSL). Thresholds cover
+// the paragliding envelope: 0=ground (green), 1000=scratch (yellow),
+// 2000=cloudbase-ish (orange), 3500+=wave/high (purple/white).
+function altitudeColor(altM: number): [number, number, number] {
+  const stops: Array<[number, [number, number, number]]> = [
+    [0, [80, 140, 60]],
+    [800, [180, 200, 80]],
+    [1600, [240, 180, 60]],
+    [2400, [220, 110, 50]],
+    [3200, [160, 80, 160]],
+    [4000, [240, 240, 255]],
+  ];
+  if (altM <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (altM <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1];
+      const [t1, c1] = stops[i];
+      const f = (altM - t0) / (t1 - t0);
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * f),
+        Math.round(c0[1] + (c1[1] - c0[1]) * f),
+        Math.round(c0[2] + (c1[2] - c0[2]) * f),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
 // Free, no-API-key style. Swap for a self-hosted style.json in production.
 const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
 
@@ -79,6 +112,9 @@ const statusEl = document.getElementById("status")!;
 const statsEl = document.getElementById("stats")!;
 const skywayToggle = document.getElementById("toggle-skyway") as HTMLInputElement;
 const thermalToggle = document.getElementById("toggle-thermal") as HTMLInputElement;
+const skywayColorRadios = document.querySelectorAll<HTMLInputElement>(
+  'input[name="skyway-color"]',
+);
 
 let skyway: FeatureCollection<LineString, SkywayFeature["properties"]> | null = null;
 let thermalDensity: FeatureCollection<
@@ -152,17 +188,41 @@ function recenter(): void {
   );
 }
 
+function skywayColorMode(): "uniform" | "altitude" {
+  for (const r of skywayColorRadios) {
+    if (r.checked) return r.value as "uniform" | "altitude";
+  }
+  return "uniform";
+}
+
 function rerender(): void {
   const layers: (PathLayer<SkywayFeature> | ScatterplotLayer<ThermalDensityFeature>)[] = [];
 
   if (skywayToggle.checked && skyway) {
+    const colorMode = skywayColorMode();
+    // PathLayer getColor can return either a single color (uniform) or a
+    // per-vertex array of colors. When colorMode === "altitude" we walk
+    // each vertex and read positions[2] (the altitude we emitted from
+    // Rust) to drive the ramp.
+    const useAltitude = colorMode === "altitude";
     layers.push(
       new PathLayer<SkywayFeature>({
         id: "skyway",
         data: skyway.features,
         getPath: (f: SkywayFeature) =>
           f.geometry.coordinates as unknown as [number, number][],
-        getColor: [80, 120, 200, 180],
+        getColor: (f: SkywayFeature) => {
+          if (!useAltitude) return [80, 120, 200, 180];
+          // Per-vertex colors. The coordinates carry [lon, lat, alt];
+          // deck.gl wants RGBA per vertex.
+          const coords = f.geometry.coordinates as unknown as Array<
+            [number, number, number]
+          >;
+          return coords.map(([_, __, alt]) => {
+            const [r, g, b] = altitudeColor(alt);
+            return [r, g, b, 200];
+          }) as unknown as [number, number, number, number];
+        },
         getWidth: 1.2,
         widthMinPixels: 1,
         widthUnits: "pixels",
@@ -220,6 +280,7 @@ function rerender(): void {
 
 skywayToggle.addEventListener("change", rerender);
 thermalToggle.addEventListener("change", rerender);
+skywayColorRadios.forEach((r) => r.addEventListener("change", rerender));
 
 map.on("load", () => {
   void load();

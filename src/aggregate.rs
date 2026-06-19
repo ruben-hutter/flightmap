@@ -15,7 +15,6 @@ use geojson::{Feature, FeatureCollection, Geometry, Value};
 use crate::bin::{bin_climbs, BinnedCell, DEFAULT_CELL_SIZE_M};
 use crate::climb::detect_climbs;
 use crate::model::{ClimbSegment, Flight};
-use crate::simplify::simplify_flight;
 
 /// All Phase 1+2 output products, ready to serialise.
 pub struct Products {
@@ -94,20 +93,44 @@ pub fn thermal_density_collection(climbs: &[ClimbSegment], cell_size_m: f64) -> 
 }
 
 fn flight_to_skyway_feature(flight: &Flight, tolerance_m: f64) -> Feature {
-    let simplified = simplify_flight(flight, tolerance_m);
-    let coords: Vec<Vec<f64>> = simplified
-        .points
+    let idxs = crate::simplify::simplify_indices(flight, tolerance_m);
+    // Emit [lon, lat, alt_baro or alt_gps] per surviving vertex. Altitude is
+    // optional — fall back to 0 if both sources are missing (rare). The 3rd
+    // coordinate lets the frontend colour per-vertex by altitude (Phase 2
+    // altitude-banding) without a separate property array.
+    let coords: Vec<Vec<f64>> = idxs
         .iter()
-        .map(|p| vec![p.lon, p.lat])
+        .map(|&i| {
+            let p = &flight.points[i];
+            let alt = p.alt_baro.or(p.alt_gps).unwrap_or(0) as f64;
+            vec![p.lon, p.lat, alt]
+        })
         .collect();
+
+    // Time range as a property, useful for the Phase 2 season / time-of-day
+    // filters in the browser (one timestamp per vertex would be overkill;
+    // start/end is enough to bucket by season).
+    let start = flight
+        .points
+        .first()
+        .map(|p| p.time.to_string())
+        .unwrap_or_default();
+    let end = flight
+        .points
+        .last()
+        .map(|p| p.time.to_string())
+        .unwrap_or_default();
+
     Feature {
         bbox: None,
         geometry: Some(Geometry::new(Value::LineString(coords))),
         id: None,
         properties: Some(
             serde_json::json!({
-                "id": simplified.id,
-                "points": simplified.points.len(),
+                "id": flight.id,
+                "points": idxs.len(),
+                "start": start,
+                "end": end,
             })
             .as_object()
             .unwrap()
