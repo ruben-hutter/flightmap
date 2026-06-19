@@ -11,7 +11,7 @@
 
 import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
-import { PathLayer, ScatterplotLayer, PolygonLayer } from "@deck.gl/layers";
+import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type {
   Feature,
@@ -21,6 +21,14 @@ import type {
   Polygon,
   MultiPolygon,
 } from "geojson";
+
+// WebGL constants used by the additive-blend parameters on the thermal
+// layer. Imported as raw numbers to avoid a @luma.gl/constants dependency
+// (deck.gl v9 changed the Parameters typing in a way that broke passing
+// these via named imports).
+const GL_FUNC_ADD = 0x8006;
+const GL_SRC_ALPHA = 0x0302;
+const GL_ONE = 1;
 
 type SkywayFeature = Feature<LineString, {
   id: string;
@@ -156,6 +164,7 @@ const kk7Toggle = document.getElementById("toggle-kk7") as HTMLInputElement;
 const airspaceToggle = document.getElementById(
   "toggle-airspace",
 ) as HTMLInputElement;
+const airspaceHintEl = document.getElementById("airspace-hint")!;
 const skywayColorRadios = document.querySelectorAll<HTMLInputElement>(
   'input[name="skyway-color"]',
 );
@@ -216,7 +225,8 @@ async function load(): Promise<void> {
 
   const [sky, therm] = await Promise.allSettled([skywayPromise, thermalPromise]);
 
-  // Airspace is optional — fail silently if absent.
+  // Airspace is optional — fail silently in the console but surface a
+  // visible hint in the panel so the toggle isn't a mystery.
   const airspacePromise = fetch(AIRSPACE_URL).then((r) => {
     if (!r.ok) throw new Error(`${AIRSPACE_URL}: ${r.status}`);
     return r.json() as Promise<
@@ -226,10 +236,13 @@ async function load(): Promise<void> {
   void airspacePromise.then(
     (fc) => {
       airspace = fc;
+      airspaceHintEl.textContent = `${fc.features.length} polygons loaded`;
       rerender();
     },
     () => {
-      /* airspace.geojson optional */
+      airspaceHintEl.textContent =
+        "no airspace.geojson in data dir — drop one (OpenAIP / OpenFlightMaps)";
+      airspaceToggle.disabled = true;
     },
   );
 
@@ -519,23 +532,39 @@ function rerender(): void {
   }
 
   if (thermalToggle.checked && filtered.thermal.length > 0) {
+    // ScatterplotLayer with additive blending on the pre-binned Mercator
+    // grid. Larger radii + low per-cell alpha + GL additive blend = the
+    // overlapping cells accumulate into a smooth density gradient (the look
+    // the old HeatmapLayer gave us, minus the per-frame density-recompute
+    // lag that killed it).
     layers.push(
       new ScatterplotLayer<ThermalDensityFeature>({
         id: "thermal",
         data: filtered.thermal,
         getPosition: (f: ThermalDensityFeature) =>
           f.geometry.coordinates as unknown as [number, number],
+        // Generous radius so neighbours overlap and blend into a gradient.
+        // Scales gently with count: busier cells paint slightly larger.
         getRadius: (f: ThermalDensityFeature) =>
-          40 + Math.min(200, f.properties.count * 8),
+          200 + Math.min(300, f.properties.count * 20),
         radiusUnits: "meters",
-        radiusMinPixels: 4,
-        radiusMaxPixels: 80,
+        radiusMinPixels: 8,
+        radiusMaxPixels: 120,
+        // Per-cell alpha stays low; additive blending does the work of
+        // building up opacity where many cells overlap.
         getFillColor: (f: ThermalDensityFeature) => {
-          const rgb = climbColor(f.properties.avg_climb_ms);
-          const alpha = Math.min(220, 80 + f.properties.count * 12);
-          return [rgb[0], rgb[1], rgb[2], alpha];
+          const [r, g, b] = climbColor(f.properties.avg_climb_ms);
+          const alpha = Math.min(140, 50 + f.properties.count * 8);
+          return [r, g, b, alpha];
         },
-        opacity: 0.75,
+        // Additive blending: dst = src + dst. Lets stacked thermals
+        // brighten into the saturated core look without expensive GPU
+        // density math. Cast through `unknown` because deck.gl v9's
+        // Parameters type doesn't expose these fields directly.
+        parameters: {
+          blendEquation: GL_FUNC_ADD,
+          blendFunc: [GL_SRC_ALPHA, GL_ONE],
+        } as unknown as never,
         stroked: false,
         pickable: true,
         onClick: (info) => {

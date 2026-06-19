@@ -9,29 +9,29 @@ importers:
   .:
     dependencies:
       '@deck.gl/aggregation-layers':
-        specifier: ^9.1.0
+        specifier: ^9.3.4
         version: 9.3.4(@deck.gl/core@9.3.4)(@deck.gl/layers@9.3.4(@deck.gl/core@9.3.4)(@loaders.gl/core@4.4.3)(@luma.gl/core@9.3.4)(@luma.gl/engine@9.3.4(@luma.gl/core@9.3.4)(@luma.gl/shadertools@9.3.4(@luma.gl/core@9.3.4))))(@luma.gl/core@9.3.4)(@luma.gl/engine@9.3.4(@luma.gl/core@9.3.4)(@luma.gl/shadertools@9.3.4(@luma.gl/core@9.3.4)))
       '@deck.gl/core':
-        specifier: ^9.1.0
+        specifier: ^9.3.4
         version: 9.3.4
       '@deck.gl/layers':
-        specifier: ^9.1.0
+        specifier: ^9.3.4
         version: 9.3.4(@deck.gl/core@9.3.4)(@loaders.gl/core@4.4.3)(@luma.gl/core@9.3.4)(@luma.gl/engine@9.3.4(@luma.gl/core@9.3.4)(@luma.gl/shadertools@9.3.4(@luma.gl/core@9.3.4)))
       '@deck.gl/mapbox':
-        specifier: ^9.1.0
+        specifier: ^9.3.4
         version: 9.3.4(@deck.gl/core@9.3.4)(@luma.gl/core@9.3.4)(@math.gl/web-mercator@4.1.0)
       maplibre-gl:
-        specifier: ^5.0.0
+        specifier: ^5.24.0
         version: 5.24.0
     devDependencies:
       '@types/geojson':
-        specifier: ^7946.0.0
+        specifier: ^7946.0.16
         version: 7946.0.16
       typescript:
-        specifier: ^5.6.0
+        specifier: ^5.9.3
         version: 5.9.3
       vite:
-        specifier: ^6.0.0
+        specifier: ^6.4.3
         version: 6.4.3(@types/node@24.13.2)
 
 packages:

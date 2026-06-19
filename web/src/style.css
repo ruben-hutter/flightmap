@@ -48,3 +48,8 @@ body,
   color: #555;
   font-size: 12px;
 }
+
+/* deck.gl's canvas sits above the map; popups need to clear it. */
+.maplibregl-popup {
+  z-index: 10;
+}
