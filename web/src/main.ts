@@ -487,8 +487,19 @@ function rerender(): void {
       new PathLayer<SkywayFeature>({
         id: "skyway",
         data: filtered.skyway,
-        getPath: (f: SkywayFeature) =>
-          f.geometry.coordinates as unknown as [number, number][],
+        // Drop the altitude (positions[2]) from the geometry — deck.gl's
+        // PathLayer reads every position element and would otherwise render
+        // the track at altitude, floating it off the map. We keep altitude
+        // available only for the colour lookup in getColor below.
+        getPath: (f: SkywayFeature) => {
+          const coords = f.geometry.coordinates as unknown as Array<
+            [number, number, number]
+          >;
+          return coords.map(([lon, lat]) => [lon, lat]) as unknown as [
+            number,
+            number,
+          ][];
+        },
         getColor: (f: SkywayFeature) => {
           if (!useAltitude) return [80, 120, 200, 180];
           const coords = f.geometry.coordinates as unknown as Array<
