@@ -82,24 +82,41 @@ function altitudeColor(altM: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
-// Colour scale for climb intensity (m/s) — drives the per-climb radial
-// gradient colour in the density canvas. Stops match the original
-// HeatmapLayer's colorRange so the visual is familiar.
-function climbColor(rate: number): [number, number, number] {
-  const stops: Array<[number, [number, number, number]]> = [
-    [0.0, [33, 102, 172]],
-    [1.5, [103, 169, 207]],
-    [2.5, [209, 229, 240]],
-    [3.5, [253, 219, 199]],
-    [5.0, [239, 138, 98]],
-    [6.5, [178, 24, 43]],
-  ];
-  if (rate <= stops[0][0]) return stops[0][1];
-  for (let i = 1; i < stops.length; i++) {
-    if (rate <= stops[i][0]) {
-      const [t0, c0] = stops[i - 1];
-      const [t1, c1] = stops[i];
-      const f = (rate - t0) / (t1 - t0);
+// ---- Thermal density rendering ----
+//
+// Build a true density field (Float32 accumulation per pixel), normalise,
+// then map through the colour ramp. Same algorithm as deck.gl's
+// HeatmapLayer but rendered once per filter change into a static texture —
+// pan/zoom just transform a quad, no per-frame work, no lag.
+//
+// Why not canvas radial gradients + 'lighter' compositing (previous attempt):
+// the colour ramp has light middle tones (pale blue, peach) that saturate
+// to white under additive blending → the "white stains" look. Per-pixel
+// density-then-colormap avoids that — each output pixel looks up its colour
+// from a single density value, so saturating to white is impossible.
+
+let thermalCanvas: HTMLCanvasElement | null = null;
+// [left, bottom, right, top] in lon/lat degrees — matches deck.gl's
+// BitmapBoundingBox 4-number form.
+let thermalBounds: [number, number, number, number] | null = null;
+
+// Same 6-stop RdYlBu_r ramp as the original HeatmapLayer colorRange.
+const DENSITY_STOPS: Array<[number, [number, number, number]]> = [
+  [0.0, [33, 102, 172]], // blue (low density)
+  [0.2, [103, 169, 207]],
+  [0.4, [209, 229, 240]],
+  [0.6, [253, 219, 199]],
+  [0.8, [239, 138, 98]],
+  [1.0, [178, 24, 43]], // red (high density)
+];
+
+function densityColor(t: number): [number, number, number] {
+  if (t <= DENSITY_STOPS[0][0]) return DENSITY_STOPS[0][1];
+  for (let i = 1; i < DENSITY_STOPS.length; i++) {
+    if (t <= DENSITY_STOPS[i][0]) {
+      const [t0, c0] = DENSITY_STOPS[i - 1];
+      const [t1, c1] = DENSITY_STOPS[i];
+      const f = (t - t0) / (t1 - t0);
       return [
         Math.round(c0[0] + (c1[0] - c0[0]) * f),
         Math.round(c0[1] + (c1[1] - c0[1]) * f),
@@ -107,24 +124,8 @@ function climbColor(rate: number): [number, number, number] {
       ];
     }
   }
-  return stops[stops.length - 1][1];
+  return DENSITY_STOPS[DENSITY_STOPS.length - 1][1];
 }
-
-// ---- Thermal density rendering ----
-//
-// Pre-render the climb density to a canvas using radial gradients + additive
-// compositing, then display via BitmapLayer. Pan/zoom just moves a static
-// image — no per-frame density recompute, no lag. Re-renders only when the
-// filter selection changes (~30 ms for a few thousand climbs).
-//
-// Bounds are padded so gradients near the edge aren't clipped. The image is
-// stretched across [minLon, minLat]–[maxLon, maxLat]; Web-Mercator warp is
-// negligible at the scale of a single pilot's flights.
-
-let thermalCanvas: HTMLCanvasElement | null = null;
-// [left, bottom, right, top] in lon/lat degrees — matches deck.gl's
-// BitmapBoundingBox 4-number form.
-let thermalBounds: [number, number, number, number] | null = null;
 
 function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
   if (climbs.length === 0) {
@@ -133,6 +134,7 @@ function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
     return;
   }
 
+  // ---- Bounds ----
   let minLon = Infinity;
   let minLat = Infinity;
   let maxLon = -Infinity;
@@ -154,35 +156,78 @@ function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
   const width = 1024;
   const height = Math.max(1, Math.round(width / aspect));
 
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d")!;
+  // ---- Gaussian kernel (precomputed) ----
+  // Sigma in pixels. Controls smoothness — 8 px gives soft, overlapping
+  // gradients similar to the HeatmapLayer at radiusPixels=60 on this bbox.
+  const sigma = 8;
+  const kernelRadius = Math.ceil(sigma * 3);
+  const kernelSize = kernelRadius * 2 + 1;
+  const kernel = new Float32Array(kernelSize * kernelSize);
+  for (let dy = -kernelRadius; dy <= kernelRadius; dy++) {
+    for (let dx = -kernelRadius; dx <= kernelRadius; dx++) {
+      const r2 = dx * dx + dy * dy;
+      kernel[(dy + kernelRadius) * kernelSize + (dx + kernelRadius)] = Math.exp(
+        -r2 / (2 * sigma * sigma),
+      );
+    }
+  }
 
-  // Additive: dst = src + dst. Overlapping gradients build up brightness
-  // into a smooth density field — same effect as the old HeatmapLayer.
-  ctx.globalCompositeOperation = "lighter";
-
+  // ---- Accumulate density ----
+  const density = new Float32Array(width * height);
   const xScale = width / (maxLon - minLon);
   const yScale = height / (maxLat - minLat);
 
   for (const f of climbs) {
     const [lon, lat] = f.geometry.coordinates as [number, number];
-    const px = (lon - minLon) * xScale;
-    const py = (maxLat - lat) * yScale; // Y flipped: canvas origin is top-left
-    const rate = f.properties.avg_climb_ms;
-    const [r, g, b] = climbColor(rate);
-    // Per-climb alpha scales with strength so strong thermals paint more.
-    const alpha = 0.18 + Math.min(0.45, rate / 12);
-    // Radius in pixels: tuned so neighbouring climbs overlap and blend.
-    const radius = 22 + Math.min(28, rate * 5);
+    const px = Math.round((lon - minLon) * xScale);
+    const py = Math.round((maxLat - lat) * yScale); // Y flipped
+    // Weight by climb strength. Floor at 0.5 m/s so weak climbs still count.
+    const weight = Math.max(0.5, f.properties.avg_climb_ms);
 
-    const grad = ctx.createRadialGradient(px, py, 0, px, py, radius);
-    grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
-    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(px - radius, py - radius, radius * 2, radius * 2);
+    for (let dy = -kernelRadius; dy <= kernelRadius; dy++) {
+      const y = py + dy;
+      if (y < 0 || y >= height) continue;
+      for (let dx = -kernelRadius; dx <= kernelRadius; dx++) {
+        const x = px + dx;
+        if (x < 0 || x >= width) continue;
+        density[y * width + x] +=
+          weight * kernel[(dy + kernelRadius) * kernelSize + (dx + kernelRadius)];
+      }
+    }
   }
+
+  // ---- Normalise and find max ----
+  let maxDensity = 0;
+  for (let i = 0; i < density.length; i++) {
+    if (density[i] > maxDensity) maxDensity = density[i];
+  }
+  if (maxDensity === 0) {
+    thermalCanvas = null;
+    thermalBounds = null;
+    return;
+  }
+
+  // ---- Density → RGBA ----
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+  const imageData = ctx.createImageData(width, height);
+  const data = imageData.data;
+
+  for (let i = 0; i < density.length; i++) {
+    const raw = density[i] / maxDensity; // 0..1
+    if (raw < 0.02) continue; // skip near-zero (keep canvas transparent there)
+    // Gamma: lift low densities so sparse thermals are still visible
+    // without crushing high densities to pure red.
+    const t = Math.pow(raw, 0.55);
+    const [r, g, b] = densityColor(t);
+    data[i * 4] = r;
+    data[i * 4 + 1] = g;
+    data[i * 4 + 2] = b;
+    data[i * 4 + 3] = Math.min(255, Math.round(t * 255));
+  }
+  ctx.putImageData(imageData, 0, 0);
 
   thermalCanvas = canvas;
   thermalBounds = [minLon, minLat, maxLon, maxLat];
