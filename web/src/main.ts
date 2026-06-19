@@ -11,9 +11,16 @@
 
 import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
-import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, PolygonLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
-import type { Feature, FeatureCollection, LineString, Point } from "geojson";
+import type {
+  Feature,
+  FeatureCollection,
+  LineString,
+  Point,
+  Polygon,
+  MultiPolygon,
+} from "geojson";
 
 type SkywayFeature = Feature<LineString, {
   id: string;
@@ -41,6 +48,13 @@ type ThermalDensityFeature = Feature<
     total_gain_m: number;
   }
 >;
+// Airspace polygons are pass-through; their properties depend on the data
+// source (OpenAIP vs OpenFlightMaps vs a local dump). We just need to find
+// a "name" if there is one for the legend / popup.
+type AirspaceFeature = Feature<
+  Polygon | MultiPolygon,
+  Record<string, unknown> & { name?: string }
+>;
 
 type Season = "all" | "spring" | "summer" | "autumn" | "winter";
 type TimeOfDay = "all" | "morning" | "midday" | "afternoon";
@@ -50,6 +64,7 @@ type TimeOfDay = "all" | "morning" | "midday" | "afternoon";
 const DATA_DIR = new URLSearchParams(location.search).get("data") ?? "/data";
 const SKYWAY_URL = `${DATA_DIR}/skyway.geojson`;
 const THERMAL_URL = `${DATA_DIR}/thermal.geojson`;
+const AIRSPACE_URL = `${DATA_DIR}/airspace.geojson`;
 
 // Pilot tz — used for season / time-of-day filters. IGC timestamps are UTC
 // (PLAN.md §4); we convert via Intl so DST is handled correctly. Make this
@@ -138,11 +153,17 @@ const statsEl = document.getElementById("stats")!;
 const skywayToggle = document.getElementById("toggle-skyway") as HTMLInputElement;
 const thermalToggle = document.getElementById("toggle-thermal") as HTMLInputElement;
 const kk7Toggle = document.getElementById("toggle-kk7") as HTMLInputElement;
+const airspaceToggle = document.getElementById(
+  "toggle-airspace",
+) as HTMLInputElement;
 const skywayColorRadios = document.querySelectorAll<HTMLInputElement>(
   'input[name="skyway-color"]',
 );
 const seasonSelect = document.getElementById("filter-season") as HTMLSelectElement;
 const todSelect = document.getElementById("filter-tod") as HTMLSelectElement;
+
+let airspace: FeatureCollection<Polygon | MultiPolygon, AirspaceFeature["properties"]> | null =
+  null;
 
 // kk7 thermal/skyways tile overlay. `{-y}` in the URL means TMS y-scheme;
 // MapLibre's `scheme: "tms"` on the source handles the flip. Only the
@@ -194,6 +215,24 @@ async function load(): Promise<void> {
   });
 
   const [sky, therm] = await Promise.allSettled([skywayPromise, thermalPromise]);
+
+  // Airspace is optional — fail silently if absent.
+  const airspacePromise = fetch(AIRSPACE_URL).then((r) => {
+    if (!r.ok) throw new Error(`${AIRSPACE_URL}: ${r.status}`);
+    return r.json() as Promise<
+      FeatureCollection<Polygon | MultiPolygon, AirspaceFeature["properties"]>
+    >;
+  });
+  void airspacePromise.then(
+    (fc) => {
+      airspace = fc;
+      rerender();
+    },
+    () => {
+      /* airspace.geojson optional */
+    },
+  );
+
   if (sky.status === "fulfilled") skyway = sky.value;
   if (therm.status === "fulfilled") thermalRaw = therm.value;
 
@@ -393,7 +432,53 @@ function rerender(): void {
   const skywayCount = filtered.skyway?.length ?? 0;
   statsEl.textContent = `${skywayCount} flights · ${filtered.totalClimbs} climbs`;
 
-  const layers: (PathLayer<SkywayFeature> | ScatterplotLayer<ThermalDensityFeature>)[] = [];
+  const layers: (
+    | PathLayer<SkywayFeature>
+    | ScatterplotLayer<ThermalDensityFeature>
+    | PolygonLayer<AirspaceFeature>
+  )[] = [];
+
+  // Airspace polygons render first (under skyway/thermal so they don't
+  // obscure the data). Polygon outlines only — fills would block the map.
+  if (airspaceToggle.checked && airspace && airspace.features.length > 0) {
+    layers.push(
+      new PolygonLayer<AirspaceFeature>({
+        id: "airspace",
+        data: airspace.features,
+        getPolygon: (f: AirspaceFeature) => {
+          // deck.gl wants the polygon as a flat position array; both
+          // Polygon and MultiPolygon can be unwrapped here.
+          const g = f.geometry;
+          if (g.type === "Polygon") {
+            return g.coordinates as unknown as number[][];
+          }
+          // MultiPolygon: use the first ring of the largest polygon as
+          // a rough outline. Phase 3 will do per-polygon rendering when
+          // the airspace layer moves server-side.
+          return (g.coordinates as unknown as number[][][][])
+            .map((poly) => poly[0])
+            .flat() as unknown as number[][];
+        },
+        getFillColor: [200, 80, 80, 30],
+        getLineColor: [200, 60, 60, 180],
+        lineWidthMinPixels: 1,
+        stroked: true,
+        filled: true,
+        pickable: true,
+        onClick: (info) => {
+          if (!info.object) return;
+          const name =
+            (info.object.properties.name as string | undefined) ??
+            (info.object.properties.Name as string | undefined) ??
+            "(unnamed)";
+          new maplibregl.Popup()
+            .setLngLat(info.coordinate as maplibregl.LngLatLike)
+            .setHTML(`<b>${name}</b>`)
+            .addTo(map);
+        },
+      }),
+    );
+  }
 
   if (skywayToggle.checked && filtered.skyway && filtered.skyway.length > 0) {
     const colorMode = skywayColorMode();
@@ -464,6 +549,8 @@ function rerender(): void {
 
 skywayToggle.addEventListener("change", rerender);
 thermalToggle.addEventListener("change", rerender);
+kk7Toggle.addEventListener("change", () => setKk7Overlay(kk7Toggle.checked));
+airspaceToggle.addEventListener("change", rerender);
 skywayColorRadios.forEach((r) => r.addEventListener("change", rerender));
 seasonSelect.addEventListener("change", rerender);
 todSelect.addEventListener("change", rerender);
