@@ -12,7 +12,7 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
 import { PathLayer } from "@deck.gl/layers";
-import { HeatmapLayer } from "@deck.gl/aggregation-layers";
+import { BitmapLayer } from "@deck.gl/layers";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
@@ -82,6 +82,112 @@ function altitudeColor(altM: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
+// Colour scale for climb intensity (m/s) — drives the per-climb radial
+// gradient colour in the density canvas. Stops match the original
+// HeatmapLayer's colorRange so the visual is familiar.
+function climbColor(rate: number): [number, number, number] {
+  const stops: Array<[number, [number, number, number]]> = [
+    [0.0, [33, 102, 172]],
+    [1.5, [103, 169, 207]],
+    [2.5, [209, 229, 240]],
+    [3.5, [253, 219, 199]],
+    [5.0, [239, 138, 98]],
+    [6.5, [178, 24, 43]],
+  ];
+  if (rate <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (rate <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1];
+      const [t1, c1] = stops[i];
+      const f = (rate - t0) / (t1 - t0);
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * f),
+        Math.round(c0[1] + (c1[1] - c0[1]) * f),
+        Math.round(c0[2] + (c1[2] - c0[2]) * f),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+// ---- Thermal density rendering ----
+//
+// Pre-render the climb density to a canvas using radial gradients + additive
+// compositing, then display via BitmapLayer. Pan/zoom just moves a static
+// image — no per-frame density recompute, no lag. Re-renders only when the
+// filter selection changes (~30 ms for a few thousand climbs).
+//
+// Bounds are padded so gradients near the edge aren't clipped. The image is
+// stretched across [minLon, minLat]–[maxLon, maxLat]; Web-Mercator warp is
+// negligible at the scale of a single pilot's flights.
+
+let thermalCanvas: HTMLCanvasElement | null = null;
+// [left, bottom, right, top] in lon/lat degrees — matches deck.gl's
+// BitmapBoundingBox 4-number form.
+let thermalBounds: [number, number, number, number] | null = null;
+
+function rebuildThermalCanvas(climbs: ThermalFeature[]): void {
+  if (climbs.length === 0) {
+    thermalCanvas = null;
+    thermalBounds = null;
+    return;
+  }
+
+  let minLon = Infinity;
+  let minLat = Infinity;
+  let maxLon = -Infinity;
+  let maxLat = -Infinity;
+  for (const f of climbs) {
+    const [lon, lat] = f.geometry.coordinates as [number, number];
+    if (lon < minLon) minLon = lon;
+    if (lat < minLat) minLat = lat;
+    if (lon > maxLon) maxLon = lon;
+    if (lat > maxLat) maxLat = lat;
+  }
+  const pad = 0.01;
+  minLon -= pad;
+  minLat -= pad;
+  maxLon += pad;
+  maxLat += pad;
+
+  const aspect = (maxLon - minLon) / (maxLat - minLat);
+  const width = 1024;
+  const height = Math.max(1, Math.round(width / aspect));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+
+  // Additive: dst = src + dst. Overlapping gradients build up brightness
+  // into a smooth density field — same effect as the old HeatmapLayer.
+  ctx.globalCompositeOperation = "lighter";
+
+  const xScale = width / (maxLon - minLon);
+  const yScale = height / (maxLat - minLat);
+
+  for (const f of climbs) {
+    const [lon, lat] = f.geometry.coordinates as [number, number];
+    const px = (lon - minLon) * xScale;
+    const py = (maxLat - lat) * yScale; // Y flipped: canvas origin is top-left
+    const rate = f.properties.avg_climb_ms;
+    const [r, g, b] = climbColor(rate);
+    // Per-climb alpha scales with strength so strong thermals paint more.
+    const alpha = 0.18 + Math.min(0.45, rate / 12);
+    // Radius in pixels: tuned so neighbouring climbs overlap and blend.
+    const radius = 22 + Math.min(28, rate * 5);
+
+    const grad = ctx.createRadialGradient(px, py, 0, px, py, radius);
+    grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(px - radius, py - radius, radius * 2, radius * 2);
+  }
+
+  thermalCanvas = canvas;
+  thermalBounds = [minLon, minLat, maxLon, maxLat];
+}
+
 const map = new maplibregl.Map({
   container: "map",
   style: BASEMAP_STYLE,
@@ -136,7 +242,7 @@ async function load(): Promise<void> {
   }
 
   recenter();
-  rerender();
+  refreshThermalCanvas();
 }
 
 function recenter(): void {
@@ -261,7 +367,7 @@ function rerender(): void {
   const skywayCount = filtered.skyway?.length ?? 0;
   statsEl.textContent = `${skywayCount} flights · ${filtered.thermal.length} climbs`;
 
-  const layers: (PathLayer<SkywayFeature> | HeatmapLayer<ThermalFeature>)[] = [];
+  const layers: (PathLayer<SkywayFeature> | BitmapLayer)[] = [];
 
   if (skywayToggle.checked && filtered.skyway && filtered.skyway.length > 0) {
     const colorMode = skywayColorMode();
@@ -301,28 +407,15 @@ function rerender(): void {
     );
   }
 
-  if (thermalToggle.checked && filtered.thermal.length > 0) {
-    // HeatmapLayer directly on filtered raw climbs. Recomputes the density
-    // texture each viewport change (hence the zoom/pan lag) — accepted
-    // trade-off; the gradient look is worth it for a personal tool.
+  if (thermalToggle.checked && thermalCanvas && thermalBounds) {
+    // BitmapLayer on the pre-rendered density canvas. No per-frame work —
+    // pan/zoom just transforms a static texture. Smooth regardless of how
+    // many climbs are in the dataset.
     layers.push(
-      new HeatmapLayer<ThermalFeature>({
+      new BitmapLayer({
         id: "thermal",
-        data: filtered.thermal,
-        getPosition: (f: ThermalFeature) =>
-          f.geometry.coordinates as unknown as [number, number],
-        getWeight: (f: ThermalFeature) => f.properties.avg_climb_ms,
-        radiusPixels: 60,
-        intensity: 1,
-        threshold: 0.05,
-        colorRange: [
-          [33, 102, 172],
-          [103, 169, 207],
-          [209, 229, 240],
-          [253, 219, 199],
-          [239, 138, 98],
-          [178, 24, 43],
-        ],
+        image: thermalCanvas,
+        bounds: thermalBounds,
         pickable: false,
       }),
     );
@@ -331,12 +424,21 @@ function rerender(): void {
   overlay.setProps({ layers });
 }
 
+// Rebuild the thermal density canvas whenever the underlying filtered climb
+// set changes — i.e. on load and on filter/tod changes. Pan/zoom do NOT
+// trigger a rebuild; that's the whole point.
+function refreshThermalCanvas(): void {
+  const filtered = applyFilters();
+  rebuildThermalCanvas(filtered.thermal);
+  rerender();
+}
+
 skywayToggle.addEventListener("change", rerender);
 thermalToggle.addEventListener("change", rerender);
 kk7Toggle.addEventListener("change", () => setKk7Overlay(kk7Toggle.checked));
 skywayColorRadios.forEach((r) => r.addEventListener("change", rerender));
-seasonSelect.addEventListener("change", rerender);
-todSelect.addEventListener("change", rerender);
+seasonSelect.addEventListener("change", refreshThermalCanvas);
+todSelect.addEventListener("change", refreshThermalCanvas);
 
 map.on("load", () => {
   void load();
