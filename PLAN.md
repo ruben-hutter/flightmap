@@ -243,14 +243,18 @@ in parallel.
   `cargo test` still green.
 
 ### Phase 2 — Paragliding-specific layers (the differentiators)
-- Altitude-banded tracks (colour by MSL/AGL).
-- Climb-rate colormap on the thermal layer.
-- Season + time-of-day filters (kk7 TimeFilter idea) — filter at aggregate time,
-  in the pilot's local tz (`chrono_tz`, set once per pilot per §4), never stored
-  per-point.
-- `airspace.rs`: load OpenAIP airspace, flag track segments brushing floors/laterals
-  → "airspace proximity" layer. (Ties into the Locarno TMA / LSZL interest.)
-- kk7 comparison tiles as an XYZ overlay (inverted-y TMS).
+- ✅ Altitude-banded tracks (per-vertex colour by MSL, toggle in UI).
+- ✅ Climb-rate colormap on the thermal layer (cell coloured by avg climb).
+- ✅ Season + time-of-day filters (kk7 TimeFilter idea). Done client-side:
+  UTC→local via `Intl.DateTimeFormat("Europe/Zurich")` so DST is handled
+  by the browser; skyway filtered by feature `start`; thermals filtered
+  and re-binned client-side to the same 150 m Mercator grid.
+- ✅ kk7 comparison tiles as an XYZ overlay (`scheme: "tms"` for inverted-y).
+- ✅ Airspace polygons display (load any GeoJSON, render outlines).
+- ⏳ **Airspace proximity** (track segments brushing floors/laterals):
+  deferred. Needs format normalisation across OpenAIP /
+  OpenFlightMaps / FOCA dumps and proper 3D floor/ceiling intersection.
+  See §8.
 - **Done when:** it's a tool you'd open before flying a site.
 
 ### Phase 3 — XContest username source (harder, grayer; pluggable)
@@ -293,4 +297,8 @@ in parallel.
   against `flights/`.
 - Project name (`flightmap` is a working title — there's a public product by
   that name; consider something more specific before publishing).
+- **Airspace proximity layer**: which data source to canonicalise on (OpenAIP,
+  OpenFlightMaps, FOCA), and how to handle floor/ceiling altitude formats
+  across them. Phase 2 ships display-only; the proximity highlight is the
+  follow-up.
 
