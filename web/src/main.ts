@@ -416,7 +416,22 @@ function rerender(): void {
   const skywayCount = filtered.skyway?.length ?? 0;
   statsEl.textContent = `${skywayCount} flights · ${filtered.thermal.length} climbs`;
 
-  const layers: (PathLayer<SkywayFeature> | BitmapLayer)[] = [];
+  const layers: (BitmapLayer | PathLayer<SkywayFeature>)[] = [];
+
+  // Push thermal FIRST so it renders at the bottom of the stack — skyway
+  // tracks then paint on top of the heatmap, which is what you want
+  // (tracks are the structural information; thermals are the heat blobs
+  // that should sit underneath).
+  if (thermalToggle.checked && thermalCanvas && thermalBounds) {
+    layers.push(
+      new BitmapLayer({
+        id: "thermal",
+        image: thermalCanvas,
+        bounds: thermalBounds,
+        pickable: false,
+      }),
+    );
+  }
 
   if (skywayToggle.checked && filtered.skyway && filtered.skyway.length > 0) {
     const colorMode = skywayColorMode();
@@ -451,20 +466,6 @@ function rerender(): void {
         getWidth: 1.2,
         widthMinPixels: 1,
         widthUnits: "pixels",
-        pickable: false,
-      }),
-    );
-  }
-
-  if (thermalToggle.checked && thermalCanvas && thermalBounds) {
-    // BitmapLayer on the pre-rendered density canvas. No per-frame work —
-    // pan/zoom just transforms a static texture. Smooth regardless of how
-    // many climbs are in the dataset.
-    layers.push(
-      new BitmapLayer({
-        id: "thermal",
-        image: thermalCanvas,
-        bounds: thermalBounds,
         pickable: false,
       }),
     );

@@ -21,6 +21,8 @@ body,
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
   max-width: 280px;
   font-size: 13px;
+  /* deck.gl's canvas sits above the basemap; the panel needs to clear it. */
+  z-index: 100;
 }
 
 #panel h1 {
