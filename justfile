@@ -3,7 +3,9 @@
 default:
     @just --list
 
-# Format everything (rust + nix + frontend once it exists).
+# ---- Rust ----
+
+# Format everything (rust + nix).
 fmt:
     cargo fmt
     @command -v nixpkgs-fmt >/dev/null && nixpkgs-fmt flake.nix || true
@@ -28,9 +30,43 @@ snap-accept:
 snap-review:
     cargo insta review
 
-# Run the Phase 0 CLI on a single IGC file.
-run file:
-    cargo run --quiet -- {{file}}
+# ---- CLI ----
+
+# Single-file stats: point count, UTC range, bbox, alt range.
+stats file:
+    cargo run --quiet -- stats {{file}}
+
+# Folder summary: total points, climbs detected, compression ratio.
+scan folder:
+    cargo run --quiet -- scan {{folder}}
+
+# Emit GeoJSON products into web/public/data so the dev server can serve them.
+# Use --release for fast parallel parse of large folders.
+emit folder:
+    cargo run --release --quiet -- emit {{folder}} --out web/public/data
+
+# ---- Web ----
+
+# Start the Vite dev server (auto-opens http://localhost:5173/).
+dev:
+    pnpm --dir web dev
+
+# Build the web bundle for production (output: web/dist/).
+build-web:
+    pnpm --dir web build
+
+# Install/reinstall web deps (after pulling changes that touched package.json).
+install-web:
+    pnpm --dir web install
+
+# ---- Full rebuild + serve ----
+
+# One-shot: re-emit data + start the dev server. The combo you usually want.
+serve folder='flights':
+    just emit {{folder}}
+    just dev
+
+# ---- Environment ----
 
 # Enter the nix dev shell explicitly (normally direnv handles this).
 shell:

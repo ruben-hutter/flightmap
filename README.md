@@ -4,17 +4,24 @@ Personal paragliding flight heatmap from IGC tracklogs. Turns a local folder of
 your own flights into personal "skyways" + thermal-core maps, with paragliding-
 specific layers kk7's aggregated tiles can't give you.
 
-Status: **Phase 0 — foundations.** The IGC parser and CLI stats work; the map
-UI comes in Phase 1. See [`PLAN.md`](./PLAN.md) for the full design.
+**Status: Phases 0–2 done.** The tool renders a personal heatmap from a local
+folder of IGC files. Phase 3 (XContest source + axum server) is next. See
+[`PLAN.md §0`](./PLAN.md) for the full status snapshot.
 
-## What's here now
+## What's here
 
 - Single Rust crate (`flightmap`, lib + bin) with the locked data model from
   `PLAN.md §4`.
-- Lenient IGC B-record parser (`src/igc.rs`) tolerant of off-spec phone/vario
-  files.
-- `flightmap <file.igc>` — prints point count, UTC time range, bbox, alt ranges.
-- Insta snapshot tests against `tests/fixtures/`.
+- Lenient IGC parser handles both `HFDTE` (Skytraxx) and `HFDTEDATE:`
+  (XCTrack) date formats — tested against 245 real flights.
+- CLI: `stats <file>`, `scan <folder>`, `emit <folder>` subcommands.
+- Web frontend (Vite + TS, MapLibre GL + deck.gl):
+  - Skyway layer (Douglas–Peucker-simplified tracks, optional altitude bands).
+  - Thermal layer (Float32 density buffer + BitmapLayer, colored by peak
+    climb rate, smooth pan/zoom).
+  - Season + time-of-day filters (DST-aware).
+  - kk7 raster comparison overlay.
+- Insta snapshot tests, clippy clean, fmt clean.
 
 ## Dev environment
 
@@ -22,39 +29,43 @@ This project uses **nix flakes + direnv**. With both installed:
 
 ```sh
 cd /path/to/flightmap   # direnv auto-loads the dev shell
-cargo test
-cargo run -- flights/2026/<some-flight>.IGC
 ```
 
 Without direnv: `nix develop`. The flake pins the Rust toolchain (stable, via
-`rust-overlay`) and node/pnpm for the Phase 1 frontend.
+`rust-overlay`) and node/pnpm for the frontend.
 
-## Phase 1 workflow
+## Daily workflow
 
 End-to-end: folder of IGC files → GeoJSON → heatmap page.
 
 ```sh
 # 1. Drop your .igc files under flights/ (gitignored).
-#    e.g. flights/2026/foo.IGC
+#    e.g. flights/2022/, flights/2023/, …, flights/2026/
 
-# 2. Scan summary (one-line per parse + totals).
-cargo run --release -- scan flights/2026/
+# 2. Emit GeoJSON straight into the dev server's static dir.
+cargo run --release -- emit flights/ --out web/public/data
 
-# 3. Emit skyway.geojson + thermal.geojson straight into the dev server's
-#    static dir. (Or use the default ./out and symlink web/public/data → ../../out.)
-cargo run --release -- emit flights/2026/ --out web/public/data
-
-# 4. Start the web dev server.
+# 3. Start the web dev server.
 pnpm --dir web dev
 # → open http://localhost:5173/
+```
+
+Or via `just`:
+
+```sh
+just serve flights     # = emit + dev in one shot
+just scan flights      # folder summary without writing files
+just stats flights/2026/foo.IGC   # single-file stats
+just test              # cargo test
+just lint              # cargo clippy -- -D warnings
 ```
 
 Tunable knobs on `emit`:
 
 ```
---tolerance-m <m>      Douglas–Peucker track tolerance (default 5)
---min-climb-ms <x>     Minimum climb rate to count as a thermal (default 0.5)
---min-duration-s <x>   Minimum sustained climb duration (default 10)
+--tolerance-m <m>         Douglas–Peucker track tolerance (default 5)
+--min-climb-ms <x>        Minimum climb rate to count as a thermal (default 0.5)
+--min-duration-s <x>      Minimum sustained climb duration (default 10)
 --smoothing-window-s <x>  Altitude smoothing window (default 5)
 ```
 
@@ -62,10 +73,14 @@ Tunable knobs on `emit`:
 
 See `PLAN.md §3` for the directory map. TL;DR:
 
-- `src/` — Rust crate (`model.rs`, `igc.rs`, `main.rs`, …)
+- `src/` — Rust crate (`model.rs`, `igc.rs`, `ingest/`, `climb.rs`,
+  `simplify.rs`, `bin.rs`, `aggregate.rs`, `main.rs`)
 - `tests/fixtures/` — committed, anonymised real IGCs for snapshot tests
-- `flights/` — gitignored; drop your real `.igc` files here (e.g. `flights/2026/`)
-- `web/` — Phase 1 frontend (Vite + TS, MapLibre GL + deck.gl)
+- `flights/` — gitignored; drop your real `.igc` files here
+  (e.g. `flights/2026/`)
+- `web/` — Vite + TS frontend (MapLibre GL + deck.gl)
+- `out/` — gitignored default emit target; the dev workflow writes to
+  `web/public/data/` instead
 - `flake.nix` / `.envrc` / `justfile` — tooling
 
 ## License

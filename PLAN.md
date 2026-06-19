@@ -7,6 +7,67 @@
 
 ---
 
+## 0. Status (read this first)
+
+**Where we are:** Phases 0, 1, 2 are done and working end-to-end. The tool
+renders a personal heatmap from a local folder of IGC files; you can fly
+through it before flying for real.
+
+**Resume point next session:** [Phase 3](#phase-3--xcontest-username-source-harder-grayer-pluggable)
+— XContest username source + axum server. That's the next major chunk of
+new functionality. Everything below Phase 3 is either polish or open
+decisions that benefit from real-world use first.
+
+### What's working right now
+
+- IGC parser handles both `HFDTE` (Skytraxx) and `HFDTEDATE:` (XCTrack)
+  date formats — tested against 245 real flights.
+- `flightmap {stats,scan,emit}` CLI subcommands.
+- Skyway layer: simplified flight tracks via Douglas–Peucker, optional
+  altitude-band coloring (green ground → red 2400 m → white 4000 m).
+- Thermal layer: per-pixel density rendered to a static canvas via
+  Float32 buffer + Gaussian kernel + MAX aggregation, colored by **peak**
+  climb rate. Pan/zoom is smooth (no per-frame work); canvas rebuilds
+  only on filter changes (~80 ms for 13 k climbs).
+- Filters: season + time-of-day dropdowns, DST-aware via
+  `Intl.DateTimeFormat("Europe/Zurich")`.
+- kk7 raster overlay (`scheme: "tms"`).
+- Snapshot tests, clippy clean, fmt clean.
+
+### Known issues / TODOs (small, do before Phase 3)
+
+- **Thermal click popups are gone** — BitmapLayer can't pick individual
+  features. Easy fix: invisible pickable ScatterplotLayer of raw climb
+  centroids layered on top.
+- **Thermal tuning knobs** (in `web/src/main.ts::rebuildThermalCanvas`):
+  - `sigma = 8` — Gaussian kernel width in pixels. Higher = smoother but
+    blurrier thermals.
+  - `MAX_RATE = 6.0` — m/s mapped to top of color ramp. Lower = weaker
+    thermals look stronger.
+  - `FULL_OPACITY_RATE = 2.5` — m/s where alpha saturates.
+- **Climb detection thresholds** (`ClimbConfig` defaults in
+  `src/climb.rs`): `min_climb_ms=0.5`, `min_duration_s=10`,
+  `smoothing_window_s=5`. Tunable via `emit` CLI flags. May need
+  adjustment after observing more flights.
+- **Circle-fit centroid for thermals** — currently mean-of-fixes per
+  PLAN.md §4. Kåsa circle fit would give more accurate thermal cores;
+  ~15 LOC in `src/climb.rs::build_segment`.
+
+### Resolved decisions (this session)
+
+- License: Apache-2.0.
+- Frontend: Vite + TypeScript.
+- Workspace shape: single crate (split when Phase 3 lands the server).
+- Dev env: nix flakes + direnv, no PROJ C dep, no distrobox.
+- Thermal rendering: client-side density buffer + BitmapLayer
+  (HeatmapLayer was too laggy; ScatterplotLayer lost the gradient).
+- Thermal coloring: peak climb rate via MAX aggregation, absolute scale.
+- Airspace: display layer was added in Phase 2 then removed — felt
+  under-baked without the proximity highlight. Revisit as part of a
+  dedicated airspace phase (see §8).
+
+---
+
 ## 1. Why this exists (don't reinvent the wheels next to it)
 
 - **kk7 (thermal.kk7.ch)** is *not* open source and its data is aggregated/anonymised
