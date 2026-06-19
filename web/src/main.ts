@@ -137,11 +137,48 @@ const statusEl = document.getElementById("status")!;
 const statsEl = document.getElementById("stats")!;
 const skywayToggle = document.getElementById("toggle-skyway") as HTMLInputElement;
 const thermalToggle = document.getElementById("toggle-thermal") as HTMLInputElement;
+const kk7Toggle = document.getElementById("toggle-kk7") as HTMLInputElement;
 const skywayColorRadios = document.querySelectorAll<HTMLInputElement>(
   'input[name="skyway-color"]',
 );
 const seasonSelect = document.getElementById("filter-season") as HTMLSelectElement;
 const todSelect = document.getElementById("filter-tod") as HTMLSelectElement;
+
+// kk7 thermal/skyways tile overlay. `{-y}` in the URL means TMS y-scheme;
+// MapLibre's `scheme: "tms"` on the source handles the flip. Only the
+// `skyways_all_all` product is referenced here — kk7 also exposes season /
+// time-of-day filtered variants (`skyways_summer_midday` etc.) which we'll
+// wire up when the filters land on the server side (Phase 3).
+const KK7_TILES_URL = "https://thermal.kk7.ch/tiles/skyways_all_all/{z}/{x}/{y}.png";
+const KK7_SOURCE_ID = "kk7-thermal";
+const KK7_LAYER_ID = "kk7-thermal-overlay";
+
+function setKk7Overlay(on: boolean): void {
+  const hasSource = !!map.getSource(KK7_SOURCE_ID);
+  if (on && !hasSource) {
+    map.addSource(KK7_SOURCE_ID, {
+      type: "raster",
+      tiles: [KK7_TILES_URL],
+      tileSize: 256,
+      scheme: "tms",
+      attribution: "thermal.kk7.ch",
+      maxzoom: 14,
+    });
+    map.addLayer({
+      id: KK7_LAYER_ID,
+      type: "raster",
+      source: KK7_SOURCE_ID,
+      paint: {
+        // Semi-transparent so the basemap shows through; this is a
+        // comparison overlay, not the primary view.
+        "raster-opacity": 0.45,
+      },
+    });
+  } else if (!on && hasSource) {
+    if (map.getLayer(KK7_LAYER_ID)) map.removeLayer(KK7_LAYER_ID);
+    map.removeSource(KK7_SOURCE_ID);
+  }
+}
 
 let skyway: FeatureCollection<LineString, SkywayFeature["properties"]> | null = null;
 let thermalRaw: FeatureCollection<Point, ThermalFeature["properties"]> | null = null;
@@ -430,6 +467,7 @@ thermalToggle.addEventListener("change", rerender);
 skywayColorRadios.forEach((r) => r.addEventListener("change", rerender));
 seasonSelect.addEventListener("change", rerender);
 todSelect.addEventListener("change", rerender);
+kk7Toggle.addEventListener("change", () => setKk7Overlay(kk7Toggle.checked));
 
 map.on("load", () => {
   void load();
