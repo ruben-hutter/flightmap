@@ -29,6 +29,35 @@ cargo run -- flights/2026/<some-flight>.IGC
 Without direnv: `nix develop`. The flake pins the Rust toolchain (stable, via
 `rust-overlay`) and node/pnpm for the Phase 1 frontend.
 
+## Phase 1 workflow
+
+End-to-end: folder of IGC files → GeoJSON → heatmap page.
+
+```sh
+# 1. Drop your .igc files under flights/ (gitignored).
+#    e.g. flights/2026/foo.IGC
+
+# 2. Scan summary (one-line per parse + totals).
+cargo run --release -- scan flights/2026/
+
+# 3. Emit skyway.geojson + thermal.geojson straight into the dev server's
+#    static dir. (Or use the default ./out and symlink web/public/data → ../../out.)
+cargo run --release -- emit flights/2026/ --out web/public/data
+
+# 4. Start the web dev server.
+pnpm --dir web dev
+# → open http://localhost:5173/
+```
+
+Tunable knobs on `emit`:
+
+```
+--tolerance-m <m>      Douglas–Peucker track tolerance (default 5)
+--min-climb-ms <x>     Minimum climb rate to count as a thermal (default 0.5)
+--min-duration-s <x>   Minimum sustained climb duration (default 10)
+--smoothing-window-s <x>  Altitude smoothing window (default 5)
+```
+
 ## Layout
 
 See `PLAN.md §3` for the directory map. TL;DR:

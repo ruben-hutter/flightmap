@@ -1,0 +1,45 @@
+html,
+body,
+#map {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: system-ui, sans-serif;
+}
+
+#map {
+  width: 100%;
+}
+
+#panel {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 12px 16px;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+  max-width: 280px;
+  font-size: 13px;
+}
+
+#panel h1 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+#panel p {
+  margin: 4px 0;
+}
+
+#panel label {
+  display: block;
+  margin: 4px 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+#stats {
+  color: #555;
+  font-size: 12px;
+}
