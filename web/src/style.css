@@ -39,6 +39,11 @@ body,
   user-select: none;
 }
 
+#panel select {
+  margin-left: 6px;
+  font: inherit;
+}
+
 #stats {
   color: #555;
   font-size: 12px;

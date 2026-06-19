@@ -21,6 +21,25 @@
         skyway: by altitude
       </label>
       <label><input type="checkbox" id="toggle-thermal" checked /> thermal</label>
+      <label>
+        season
+        <select id="filter-season">
+          <option value="all">all</option>
+          <option value="spring">spring</option>
+          <option value="summer">summer</option>
+          <option value="autumn">autumn</option>
+          <option value="winter">winter</option>
+        </select>
+      </label>
+      <label>
+        time of day
+        <select id="filter-tod">
+          <option value="all">all</option>
+          <option value="morning">morning (06–12)</option>
+          <option value="midday">midday (12–15)</option>
+          <option value="afternoon">afternoon (15–19)</option>
+        </select>
+      </label>
       <p id="stats"></p>
     </div>
     <script type="module" src="/src/main.ts"></script>

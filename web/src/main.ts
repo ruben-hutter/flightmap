@@ -21,6 +21,17 @@ type SkywayFeature = Feature<LineString, {
   start: string;
   end: string;
 }>;
+type ThermalFeature = Feature<
+  Point,
+  {
+    flight_id: string;
+    avg_climb_ms: number;
+    peak_climb_ms: number;
+    gain_m: number;
+    start: string;
+    end: string;
+  }
+>;
 type ThermalDensityFeature = Feature<
   Point,
   {
@@ -31,11 +42,25 @@ type ThermalDensityFeature = Feature<
   }
 >;
 
+type Season = "all" | "spring" | "summer" | "autumn" | "winter";
+type TimeOfDay = "all" | "morning" | "midday" | "afternoon";
+
 // Where `flightmap emit` writes its products. Override per-deployment via
 // ?data=... query param if needed.
 const DATA_DIR = new URLSearchParams(location.search).get("data") ?? "/data";
 const SKYWAY_URL = `${DATA_DIR}/skyway.geojson`;
-const THERMAL_DENSITY_URL = `${DATA_DIR}/thermal_density.geojson`;
+const THERMAL_URL = `${DATA_DIR}/thermal.geojson`;
+
+// Pilot tz — used for season / time-of-day filters. IGC timestamps are UTC
+// (PLAN.md §4); we convert via Intl so DST is handled correctly. Make this
+// configurable when the Phase 3 server lands.
+const PILOT_TZ = "Europe/Zurich";
+
+// Cell size for client-side thermal re-binning. Must match
+// `DEFAULT_CELL_SIZE_M` in `src/bin.rs` so the unfiltered view is identical
+// to the server-binned `thermal_density.geojson`.
+const CELL_SIZE_M = 150;
+const EARTH_R = 6_378_137;
 
 // Colour scale for climb intensity (m/s). Thresholds are loose paraglider
 // intuition: <1.5 weak scratch, 1.5-3.5 average thermal, >3.5 strong climb.
@@ -115,32 +140,29 @@ const thermalToggle = document.getElementById("toggle-thermal") as HTMLInputElem
 const skywayColorRadios = document.querySelectorAll<HTMLInputElement>(
   'input[name="skyway-color"]',
 );
+const seasonSelect = document.getElementById("filter-season") as HTMLSelectElement;
+const todSelect = document.getElementById("filter-tod") as HTMLSelectElement;
 
 let skyway: FeatureCollection<LineString, SkywayFeature["properties"]> | null = null;
-let thermalDensity: FeatureCollection<
-  Point,
-  ThermalDensityFeature["properties"]
-> | null = null;
+let thermalRaw: FeatureCollection<Point, ThermalFeature["properties"]> | null = null;
 
 async function load(): Promise<void> {
   const skywayPromise = fetch(SKYWAY_URL).then((r) => {
     if (!r.ok) throw new Error(`${SKYWAY_URL}: ${r.status}`);
     return r.json() as Promise<FeatureCollection<LineString, SkywayFeature["properties"]>>;
   });
-  const densityPromise = fetch(THERMAL_DENSITY_URL).then((r) => {
-    if (!r.ok) throw new Error(`${THERMAL_DENSITY_URL}: ${r.status}`);
-    return r.json() as Promise<
-      FeatureCollection<Point, ThermalDensityFeature["properties"]>
-    >;
+  const thermalPromise = fetch(THERMAL_URL).then((r) => {
+    if (!r.ok) throw new Error(`${THERMAL_URL}: ${r.status}`);
+    return r.json() as Promise<FeatureCollection<Point, ThermalFeature["properties"]>>;
   });
 
-  const [sky, density] = await Promise.allSettled([skywayPromise, densityPromise]);
+  const [sky, therm] = await Promise.allSettled([skywayPromise, thermalPromise]);
   if (sky.status === "fulfilled") skyway = sky.value;
-  if (density.status === "fulfilled") thermalDensity = density.value;
+  if (therm.status === "fulfilled") thermalRaw = therm.value;
 
   const missing: string[] = [];
   if (sky.status !== "fulfilled") missing.push("skyway");
-  if (density.status !== "fulfilled") missing.push("thermal_density");
+  if (therm.status !== "fulfilled") missing.push("thermal");
 
   if (missing.length === 2) {
     statusEl.textContent = `failed to load ${missing.join(" + ")}.`;
@@ -151,13 +173,6 @@ async function load(): Promise<void> {
   } else {
     statusEl.textContent = "ready.";
   }
-
-  const skywayCount = skyway?.features.length ?? 0;
-  const climbCount = thermalDensity?.features.reduce(
-    (sum, f) => sum + f.properties.count,
-    0,
-  ) ?? 0;
-  statsEl.textContent = `${skywayCount} flights · ${climbCount} climbs`;
 
   recenter();
   rerender();
@@ -195,26 +210,165 @@ function skywayColorMode(): "uniform" | "altitude" {
   return "uniform";
 }
 
+// ---- Pilot-tz conversion (UTC → Europe/Zurich) ----
+// Intl.DateTimeFormat with `timeZone` handles DST; no library needed.
+function localParts(isoUtc: string): { month: number; hour: number } | null {
+  // The Rust side emits "YYYY-MM-DD HH:MM:SS" — a NaiveDateTime, implicitly
+  // UTC because IGC is UTC. Re-parse as UTC explicitly.
+  const d = new Date(isoUtc.replace(" ", "T") + "Z");
+  if (Number.isNaN(d.getTime())) return null;
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: PILOT_TZ,
+    month: "numeric",
+    hour: "numeric",
+    hour12: false,
+  });
+  const parts = fmt.formatToParts(d);
+  const month = Number(parts.find((p) => p.type === "month")?.value ?? 0);
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0);
+  return { month, hour: hour === 24 ? 0 : hour };
+}
+
+function classifySeason(month: number): Season {
+  if (month === 12 || month <= 2) return "winter";
+  if (month <= 5) return "spring";
+  if (month <= 8) return "summer";
+  return "autumn";
+}
+
+function classifyTod(hour: number): TimeOfDay {
+  if (hour < 12) return "morning";
+  if (hour < 15) return "midday";
+  return "afternoon";
+}
+
+// ---- Client-side Mercator binning of filtered climbs ----
+// Mirrors src/bin.rs so an unfiltered view == server-side thermal_density.
+function project(latDeg: number, lonDeg: number): [number, number] {
+  const lat = (latDeg * Math.PI) / 180;
+  const lon = (lonDeg * Math.PI) / 180;
+  return [EARTH_R * lon, EARTH_R * Math.asinh(Math.tan(lat))];
+}
+
+function unproject(x: number, y: number): [number, number] {
+  const lon = (x / EARTH_R) * (180 / Math.PI);
+  const lat = (Math.atan(Math.sinh(y / EARTH_R)) * 180) / Math.PI;
+  return [lat, lon];
+}
+
+function binClimbs(climbs: ThermalFeature[]): ThermalDensityFeature[] {
+  const bins = new Map<
+    string,
+    {
+      kx: number;
+      ky: number;
+      count: number;
+      rateSum: number;
+      peak: number;
+      gainSum: number;
+    }
+  >();
+  for (const f of climbs) {
+    const [lon, lat] = f.geometry.coordinates as [number, number];
+    const [x, y] = project(lat, lon);
+    const kx = Math.floor(x / CELL_SIZE_M);
+    const ky = Math.floor(y / CELL_SIZE_M);
+    const key = `${kx},${ky}`;
+    let b = bins.get(key);
+    if (!b) {
+      b = {
+        kx,
+        ky,
+        count: 0,
+        rateSum: 0,
+        peak: -Infinity,
+        gainSum: 0,
+      };
+      bins.set(key, b);
+    }
+    b.count++;
+    b.rateSum += f.properties.avg_climb_ms;
+    if (f.properties.peak_climb_ms > b.peak) b.peak = f.properties.peak_climb_ms;
+    b.gainSum += f.properties.gain_m;
+  }
+  const out: ThermalDensityFeature[] = [];
+  for (const b of bins.values()) {
+    const cx = b.kx * CELL_SIZE_M + CELL_SIZE_M / 2;
+    const cy = b.ky * CELL_SIZE_M + CELL_SIZE_M / 2;
+    const [lat, lon] = unproject(cx, cy);
+    out.push({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: [lon, lat] },
+      properties: {
+        count: b.count,
+        avg_climb_ms: b.rateSum / b.count,
+        peak_climb_ms: b.peak,
+        total_gain_m: b.gainSum,
+      },
+    });
+  }
+  return out;
+}
+
+// Apply the current season + time-of-day filters. Returns null if the
+// filter rejects everything (so the caller can show an empty state).
+function applyFilters(): {
+  skyway: SkywayFeature[] | null;
+  thermal: ThermalDensityFeature[];
+  totalClimbs: number;
+} {
+  const season = seasonSelect.value as Season;
+  const tod = todSelect.value as TimeOfDay;
+
+  const filteredSkyway: SkywayFeature[] | null = skyway
+    ? skyway.features.filter((f) => {
+        if (season === "all" && tod === "all") return true;
+        const parts = localParts(f.properties.start);
+        if (!parts) return true; // unparseable → keep
+        if (season !== "all" && classifySeason(parts.month) !== season) return false;
+        if (tod !== "all" && classifyTod(parts.hour) !== tod) return false;
+        return true;
+      })
+    : null;
+
+  const filteredThermalRaw: ThermalFeature[] = thermalRaw
+    ? thermalRaw.features.filter((f) => {
+        if (season === "all" && tod === "all") return true;
+        const parts = localParts(f.properties.start);
+        if (!parts) return true;
+        if (season !== "all" && classifySeason(parts.month) !== season) return false;
+        if (tod !== "all" && classifyTod(parts.hour) !== tod) return false;
+        return true;
+      })
+    : [];
+
+  const binned = binClimbs(filteredThermalRaw);
+  return {
+    skyway: filteredSkyway,
+    thermal: binned,
+    totalClimbs: filteredThermalRaw.length,
+  };
+}
+
 function rerender(): void {
+  const filtered = applyFilters();
+
+  const skywayCount = filtered.skyway?.length ?? 0;
+  statsEl.textContent = `${skywayCount} flights · ${filtered.totalClimbs} climbs`;
+
   const layers: (PathLayer<SkywayFeature> | ScatterplotLayer<ThermalDensityFeature>)[] = [];
 
-  if (skywayToggle.checked && skyway) {
+  if (skywayToggle.checked && filtered.skyway && filtered.skyway.length > 0) {
     const colorMode = skywayColorMode();
-    // PathLayer getColor can return either a single color (uniform) or a
-    // per-vertex array of colors. When colorMode === "altitude" we walk
-    // each vertex and read positions[2] (the altitude we emitted from
-    // Rust) to drive the ramp.
     const useAltitude = colorMode === "altitude";
     layers.push(
       new PathLayer<SkywayFeature>({
         id: "skyway",
-        data: skyway.features,
+        data: filtered.skyway,
         getPath: (f: SkywayFeature) =>
           f.geometry.coordinates as unknown as [number, number][],
         getColor: (f: SkywayFeature) => {
           if (!useAltitude) return [80, 120, 200, 180];
-          // Per-vertex colors. The coordinates carry [lon, lat, alt];
-          // deck.gl wants RGBA per vertex.
           const coords = f.geometry.coordinates as unknown as Array<
             [number, number, number]
           >;
@@ -231,27 +385,20 @@ function rerender(): void {
     );
   }
 
-  if (thermalToggle.checked && thermalDensity) {
-    // ScatterplotLayer on the pre-binned Mercator grid. Much cheaper than
-    // HeatmapLayer (no per-frame density recompute); the binned cells +
-    // large translucent radii fake the heatmap look naturally.
+  if (thermalToggle.checked && filtered.thermal.length > 0) {
     layers.push(
       new ScatterplotLayer<ThermalDensityFeature>({
         id: "thermal",
-        data: thermalDensity.features,
+        data: filtered.thermal,
         getPosition: (f: ThermalDensityFeature) =>
           f.geometry.coordinates as unknown as [number, number],
-        // Radius scales with climb count: more visits = bigger blob.
-        // In metres so it tracks zoom naturally.
         getRadius: (f: ThermalDensityFeature) =>
           40 + Math.min(200, f.properties.count * 8),
         radiusUnits: "meters",
         radiusMinPixels: 4,
         radiusMaxPixels: 80,
-        // Color by avg climb rate (the Phase 2 climb-rate colormap).
         getFillColor: (f: ThermalDensityFeature) => {
           const rgb = climbColor(f.properties.avg_climb_ms);
-          // Alpha: busier cells are more opaque.
           const alpha = Math.min(220, 80 + f.properties.count * 12);
           return [rgb[0], rgb[1], rgb[2], alpha];
         },
@@ -281,6 +428,8 @@ function rerender(): void {
 skywayToggle.addEventListener("change", rerender);
 thermalToggle.addEventListener("change", rerender);
 skywayColorRadios.forEach((r) => r.addEventListener("change", rerender));
+seasonSelect.addEventListener("change", rerender);
+todSelect.addEventListener("change", rerender);
 
 map.on("load", () => {
   void load();
